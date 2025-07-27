@@ -56,6 +56,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import android.content.Intent
+import androidx.appcompat.app.AlertDialog
 
 private const val TAG = "LabRecorder"
 
@@ -80,6 +82,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val isScanning = mutableStateOf(false)
     val discoveredDevices = mutableStateListOf<BleDevice>()
     val groupId = mutableStateOf("")
+    val participantId = mutableStateOf("") // New state for single participant ID
     val isRecording = mutableStateOf(false)
     val isIntervalRunning = mutableStateOf(false)
     val connectionState1 = mutableStateOf("Disconnected")
@@ -89,6 +92,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val logMessages = mutableStateListOf<String>()
     val selectedDevice1 = mutableStateOf<BleDevice?>(null)
     val selectedDevice2 = mutableStateOf<BleDevice?>(null)
+    val numberOfParticipants = mutableStateOf(0) // New state for number of participants
 
 
     // --- Connection & File Management ---
@@ -171,8 +175,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (discoveredDevices.none { it.address == device.address }) {
                     addLog("Found device: ${device.name}")
                     discoveredDevices.add(device)
-                    if (discoveredDevices.size >= 2) {
-                        addLog("Found 2 Polar devices. Stopping scan.")
+                    if (discoveredDevices.size >= numberOfParticipants.value) {
+                        addLog("Found ${numberOfParticipants.value} Polar device(s). Stopping scan.")
                         stopBleScan()
                     }
                 }
@@ -285,42 +289,58 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun connectToDevices() {
         val address1 = selectedDevice1.value?.address ?: ""
-        val address2 = selectedDevice2.value?.address ?: ""
+        val address2 = if (numberOfParticipants.value == 2) selectedDevice2.value?.address else ""
         disconnectAll()
         if (address1.isNotEmpty()) {
             val device = bluetoothAdapter?.getRemoteDevice(address1)
             addLog("Attempting to connect to P1: $address1")
             gatt1 = device?.connectGatt(getApplication(), false, gattCallback)
         }
-        if (address2.isNotEmpty() && address1 != address2) {
+        if (address2?.isNotEmpty() == true && address1 != address2) {
             val device = bluetoothAdapter?.getRemoteDevice(address2)
             addLog("Attempting to connect to P2: $address2")
             gatt2 = device?.connectGatt(getApplication(), false, gattCallback)
         }
     }
 
-    private fun disconnectAll() {
+    fun disconnectAll() {
         gatt1?.disconnect()
         gatt2?.disconnect()
     }
 
     // --- File Recording Logic ---
     fun startRecording() {
-        if (groupId.value.isBlank()) {
+        if (numberOfParticipants.value == 2 && groupId.value.isBlank()) {
             addLog("ERROR: Group ID cannot be empty.")
             Toast.makeText(getApplication(), "Group ID cannot be empty.", Toast.LENGTH_SHORT).show()
             return
+        } else if (numberOfParticipants.value == 1 && participantId.value.isBlank()) {
+            addLog("ERROR: Participant ID cannot be empty.")
+            Toast.makeText(getApplication(), "Participant ID cannot be empty.", Toast.LENGTH_SHORT).show()
+            return
         }
-        addLog("Starting recording for group: ${groupId.value}")
+
         val baseDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "LabRecorder")
-        val groupDir = File(baseDir, groupId.value)
-        if (!groupDir.exists() && !groupDir.mkdirs()) {
-            addLog("ERROR: Failed to create group directory.")
+        val recordingDir = if (numberOfParticipants.value == 2) {
+            addLog("Starting recording for group: ${groupId.value}")
+            File(baseDir, groupId.value)
+        } else {
+            addLog("Starting recording for participant: ${participantId.value}")
+            val singleRecordingsDir = File(baseDir, "SingleRecordings")
+            File(singleRecordingsDir, participantId.value)
+        }
+
+        if (!recordingDir.exists() && !recordingDir.mkdirs()) {
+            addLog("ERROR: Failed to create recording directory.")
             return
         }
 
         if (gatt1?.device?.address != null) {
-            val deviceDir = File(groupDir, "Participant_1")
+            val deviceDir = if (numberOfParticipants.value == 2) {
+                File(recordingDir, "Participant_1")
+            } else {
+                recordingDir // For single participant, use the participant directory directly
+            }
             deviceDir.mkdirs()
             try {
                 hrWriter1 = BufferedWriter(FileWriter(File(deviceDir, "hr.csv"))).apply { write("timestamp,hr\n") }
@@ -328,8 +348,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: IOException) { addLog("ERROR: Failed creating writers for P1.") }
         }
 
-        if (gatt2?.device?.address != null) {
-            val deviceDir = File(groupDir, "Participant_2")
+        if (numberOfParticipants.value == 2 && gatt2?.device?.address != null) {
+            val deviceDir = File(recordingDir, "Participant_2")
             deviceDir.mkdirs()
             try {
                 hrWriter2 = BufferedWriter(FileWriter(File(deviceDir, "hr.csv"))).apply { write("timestamp,hr\n") }
@@ -338,7 +358,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         try {
-            timestampWriter = BufferedWriter(FileWriter(File(groupDir, "timestamps.csv"))).apply { write("timestamp,event_type\n") }
+            timestampWriter = BufferedWriter(FileWriter(File(recordingDir, "timestamps.csv"))).apply { write("timestamp,event_type\n") }
         } catch(e: IOException) { addLog("ERROR: Failed creating timestamp writer.") }
 
         isRecording.value = true
@@ -395,6 +415,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels()
+    private var showExitDialog by mutableStateOf(false)
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
@@ -405,6 +426,27 @@ class MainActivity : ComponentActivity() {
                 Toast.makeText(this, "Bluetooth permissions are required for this app to function.", Toast.LENGTH_LONG).show()
             }
         }
+
+    override fun onBackPressed() {
+        // If recording is in progress, show a warning dialog
+        if (viewModel.isRecording.value) {
+            showExitDialog = true
+        } else {
+            returnToSelection()
+        }
+    }
+
+    private fun returnToSelection() {
+        // Stop any ongoing operations
+        viewModel.stopBleScan()
+        viewModel.disconnectAll()
+        
+        // Start ParticipantSelectionActivity
+        val intent = Intent(this, ParticipantSelectionActivity::class.java)
+        intent.flags = Intent.FLAG_ACTIVITY_CLEAR_TOP
+        startActivity(intent)
+        finish()
+    }
 
     private fun hasRequiredBluetoothPermissions(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -424,16 +466,41 @@ class MainActivity : ComponentActivity() {
         requestPermissionLauncher.launch(permissionsToRequest)
     }
 
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Get the number of participants from the intent
+        val numberOfParticipants = intent.getIntExtra("NUMBER_OF_PARTICIPANTS", 2)
+        viewModel.numberOfParticipants.value = numberOfParticipants
 
         // Lock orientation to vertical to prevent activity recreation on rotation
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
 
         setContent {
             LabRecorderTheme {
+                if (showExitDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showExitDialog = false },
+                        title = { Text("Recording in Progress") },
+                        text = { Text("Stop recording and return to selection screen?") },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                showExitDialog = false
+                                viewModel.stopRecording()
+                                returnToSelection()
+                            }) {
+                                Text("Yes")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showExitDialog = false }) {
+                                Text("No")
+                            }
+                        }
+                    )
+                }
+
                 Scaffold { innerPadding ->
                     MainScreen(
                         modifier = Modifier.padding(innerPadding),
@@ -443,7 +510,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Check for permissions and start the initial scan automatically
+        // Check for permissions and start scanning if granted
         if (hasRequiredBluetoothPermissions()) {
             viewModel.startBleScan()
         } else {
@@ -457,7 +524,7 @@ fun MainScreen(
     modifier: Modifier = Modifier,
     viewModel: MainViewModel
 ) {
-    // Read state from the ViewModel. The `by` keyword unwraps the State<T> into T.
+    // Read state from the ViewModel
     val isScanning by viewModel.isScanning
     val discoveredDevices = viewModel.discoveredDevices
     val connectionStatus1 by viewModel.connectionState1
@@ -465,11 +532,13 @@ fun MainScreen(
     val hrValue1 by viewModel.hrValue1
     val hrValue2 by viewModel.hrValue2
     val groupId by viewModel.groupId
+    val participantId by viewModel.participantId
     val isRecording by viewModel.isRecording
     val isIntervalRunning by viewModel.isIntervalRunning
     val logMessages = viewModel.logMessages
     val selectedDevice1 by viewModel.selectedDevice1
     val selectedDevice2 by viewModel.selectedDevice2
+    val numberOfParticipants by viewModel.numberOfParticipants
 
     val dropdownOptions = when {
         discoveredDevices.isNotEmpty() -> discoveredDevices
@@ -488,14 +557,25 @@ fun MainScreen(
         // --- Section 1: Setup ---
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(
-                    value = groupId,
-                    onValueChange = { viewModel.groupId.value = it },
-                    label = { Text("Group ID *") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                    enabled = !isRecording
-                )
+                if (numberOfParticipants == 2) {
+                    OutlinedTextField(
+                        value = groupId,
+                        onValueChange = { viewModel.groupId.value = it },
+                        label = { Text("Group ID *") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        enabled = !isRecording
+                    )
+                } else if (numberOfParticipants == 1) {
+                    OutlinedTextField(
+                        value = participantId,
+                        onValueChange = { viewModel.participantId.value = it },
+                        label = { Text("Participant ID *") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        enabled = !isRecording
+                    )
+                }
                 Button(
                     onClick = { if (isScanning) viewModel.stopBleScan() else viewModel.startBleScan() },
                     modifier = Modifier.fillMaxWidth(),
@@ -526,17 +606,19 @@ fun MainScreen(
                     status = connectionStatus1,
                     hrValue = hrValue1
                 )
-                DeviceSelectionDropdown(
-                    label = "Participant 2",
-                    options = dropdownOptions,
-                    selectedOption = selectedDevice2,
-                    onOptionSelected = { viewModel.selectedDevice2.value = it },
-                    expanded = expanded2,
-                    onExpandedChange = { expanded2 = it },
-                    enabled = discoveredDevices.isNotEmpty() && !isRecording,
-                    status = connectionStatus2,
-                    hrValue = hrValue2
-                )
+                if (numberOfParticipants == 2) {
+                    DeviceSelectionDropdown(
+                        label = "Participant 2",
+                        options = dropdownOptions,
+                        selectedOption = selectedDevice2,
+                        onOptionSelected = { viewModel.selectedDevice2.value = it },
+                        expanded = expanded2,
+                        onExpandedChange = { expanded2 = it },
+                        enabled = discoveredDevices.isNotEmpty() && !isRecording,
+                        status = connectionStatus2,
+                        hrValue = hrValue2
+                    )
+                }
                 Button(
                     onClick = { viewModel.connectToDevices() },
                     enabled = (selectedDevice1 != null || selectedDevice2 != null) && !isRecording,
@@ -552,7 +634,9 @@ fun MainScreen(
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(
                     onClick = { if (isRecording) viewModel.stopRecording() else viewModel.startRecording() },
-                    enabled = (connectionStatus1 == "Connected" || connectionStatus2 == "Connected") && groupId.isNotBlank(),
+                    enabled = (connectionStatus1 == "Connected" || connectionStatus2 == "Connected") && 
+                             ((numberOfParticipants == 2 && groupId.isNotBlank()) || 
+                              (numberOfParticipants == 1 && participantId.isNotBlank())),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (isRecording) Color(0xFFD32F2F) else MaterialTheme.colorScheme.primary
                     ),
@@ -697,4 +781,37 @@ fun LogConsole(logMessages: List<String>, modifier: Modifier = Modifier) {
             }
         }
     }
+}
+
+@Composable
+fun ParticipantSelectionDialog(
+    onDismiss: (Int) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = { /* Do nothing, force selection */ },
+        title = { Text("Select Number of Participants") },
+        text = { Text("Please select the number of participants for this recording session.") },
+        confirmButton = {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                Button(
+                    onClick = { onDismiss(1) },
+                    modifier = Modifier.weight(1f).padding(end = 8.dp)
+                ) {
+                    Text("1 Participant")
+                }
+                Button(
+                    onClick = { onDismiss(2) },
+                    modifier = Modifier.weight(1f).padding(start = 8.dp)
+                ) {
+                    Text("2 Participants")
+                }
+            }
+        },
+        dismissButton = null // No dismiss button to force selection
+    )
 }

@@ -69,4 +69,5 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("com.patrykandpatrick.vico:compose-m3:1.14.0")
     implementation("com.patrykandpatrick.vico:core:1.14.0")
+    implementation("com.github.PhilJay:MPAndroidChart:v3.1.0")
 }
